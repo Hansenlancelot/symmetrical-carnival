@@ -1,0 +1,1684 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import pandas as pd
+import numpy as np
+from sklearn import datasets, linear_model
+from sklearn import metrics,linear_model,svm,preprocessing,tree,ensemble,naive_bayes,neighbors
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.model_selection import learning_curve,cross_val_score, GridSearchCV, train_test_split
+from sklearn.feature_selection import SelectKBest, chi2
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import xgboost as xgb
+from xgboost import XGBClassifier
+import matplotlib.pyplot as plt
+from sklearn.neural_network import MLPClassifier
+import ta
+import random
+import seaborn as sns
+
+
+# ## Loading Data
+
+# In[2]:
+
+
+#Loading BTC/USD Prices
+BTC = pd.read_csv('crypto_dfs/BTC-USD.csv')
+features = BTC
+features.set_index('Date',inplace=True)
+
+#Loading BTC technical Analysis 
+btc = pd.read_csv('crypto_dfs/btc.csv')
+btc.set_index('date',inplace=True)
+btc_2010 = btc.loc['2010-07-16':'2019-07-23']
+
+
+# In[3]:
+
+
+features = features.join(btc_2010,how='outer')
+
+
+# ## Feature Functions
+
+# In[4]:
+
+
+def ExpMovingAvg(data, window):
+    weights = np.exp(np.linspace(-1.,0.,window))
+    weights /= weights.sum()
+    
+    a = np.convolve(data,weights)[:len(data)]
+    a[:window] = None
+    return a
+
+def EMA(window):
+    weights = np.exp(np.linspace(-1.,0.,window))
+    weights /= weights.sum()
+    
+    a = np.convolve(features['Adj Close'],weights)[:len(features['Adj Close'])]
+    a[:window] = None
+    features['EMA_'+str(window)] = a
+    
+def RSISMA(window):
+    delta = features['Adj Close'].diff()
+    
+    up, down = delta.copy(), delta.copy()
+    up[up < 0] = 0
+    down[down > 0] = 0
+    
+    roll_up = np.array(up.rolling(window=window).mean())
+    roll_down = np.array(down.abs().rolling(window=window).mean())
+
+    RS = roll_up / roll_down
+    RSI = 100.0 - (100.0 / (1.0 + RS))
+    features['RSI_SMA'] = RSI
+    
+def RSIEMA(window):
+    delta = features['Adj Close'].diff()
+    
+    up, down = delta.copy(), delta.copy()
+    up[up < 0] = 0
+    down[down > 0] = 0
+    
+    roll_up = ExpMovingAvg(up,window)
+    roll_down = ExpMovingAvg(down.abs(),window)
+
+    RS = roll_up / roll_down
+    RSI = 100.0 - (100.0 / (1.0 + RS))
+    features['RSI_EMA'] = RSI
+    
+def target(data):
+    deltas = data.diff()
+    target = [1 if delta >= 0 else 0 for delta in deltas]
+    target[0] = 1
+    return target
+
+def MA(window):
+    features['MA_'+str(window)] = features['Adj Close'].rolling(window=window).mean()
+    
+def MovingAvg(data, window):
+    SMA = data.rolling(window=window).mean()
+    return np.array(SMA)
+
+def UB(window):
+    UB = features['High']*(1 + 4 * (features['High']-features['Low']) / (features['High'] + features['Low']))
+    MA = MovingAvg(UB,window)
+    features['UB_'+str(window)] = MA
+    
+def DB(window):
+    DB = features['Low']*(1 - 4 * (features['High']-features['Low']) / (features['High'] + features['Low']))
+    MA = MovingAvg(DB,window)
+    features['DB_'+str(window)] = MA
+    
+def PROC(window):
+    features['PROC_'+str(window)] = (features['Adj Close'] - features['Adj Close'].shift(window))/features['Adj Close'].shift(window)
+    
+def MFI(window):
+    features['MFI_'+str(window)] = ta.momentum.money_flow_index(features['High'], features['Low'], features['Close'], features['Volume'], n=window, fillna=False)
+    
+def STO_SIG(window):
+    features['STO_SIG_'+str(window)] = ta.momentum.stoch_signal(features['High'], features['Low'], features['Adj Close'], n=14, d_n=window, fillna=False)
+       
+def UO(s,m,l,ws,wm,wl):
+    features['UO_'+str(s)+'_'+str(m)+'_'+str(l)] = ta.momentum.uo(features['High'], features['Low'], features['Adj Close'], s=s, m=m, len=l, ws=ws, wm=wm, wl=wl, fillna=False)
+    
+def CMF(window):
+    features['CMF_'+str(window)] = ta.volume.chaikin_money_flow(features['High'], features['Low'], features['Adj Close'], features['Volume'], n=window, fillna=False)
+    
+def EMV(window):
+    features['EMV_'+str(window)] = ta.volume.ease_of_movement(features['High'], features['Low'], features['Adj Close'], features['Volume'], n=window, fillna=False)
+
+def FI(window):
+    features['FI_'+str(window)] = ta.volume.force_index(features['Adj Close'], features['Volume'], n=window, fillna=False)
+    
+def OBV():
+    features['OBV'] = ta.volume.on_balance_volume(features['Adj Close'], features['Volume'], fillna=False)
+    
+def ATR(window):
+    features['ATR_'+str(window)] = ta.volatility.average_true_range(features['High'], features['Low'], features['Adj Close'], n=window, fillna=False)
+    
+def BBHB(window):
+    factor = input('# of factors to use for BBHB: ')
+    factor = int(factor)
+    features['BBHB_'+str(window)+'_'+str(factor)] = ta.volatility.bollinger_hband(features['Adj Close'], n=window, ndev=factor, fillna=False)
+
+def BBLB(window):
+    factor = input('# of factors to use for BBLB: ')
+    factor = int(factor)
+    features['BBLB_'+str(window)+'_'+str(factor)] = ta.volatility.bollinger_lband(features['Adj Close'], n=window, ndev=factor, fillna=False)
+    
+def BBHBI(window,factor):
+    features['BBHBI_'+str(window)+'_'+str(factor)] = ta.volatility.bollinger_hband_indicator(features['Adj Close'], n=window, ndev=factor, fillna=False)
+
+def BBMA(window):
+    features['BBMA_'+str(window)] = ta.volatility.bollinger_mavg(features['Adj Close'], n=window, fillna=False)
+    
+def ROI(window):
+    """return on investment"""
+    features['ROI_'+str(window)] = (features['Adj Close'] - features['Adj Close'].shift(window))/features['Adj Close'].shift(window)
+    
+def DCHB(window):
+    '''Donchian channel HighBand'''
+    features['DCHB_'+str(window)] = ta.volatility.donchian_channel_hband(features['Adj Close'], n=window, fillna=False)
+    
+def DCLB(window):
+    '''Donchian channel LowBand'''
+    features['DCLB_'+str(window)] = ta.volatility.donchian_channel_lband(features['Adj Close'], n=window, fillna=False)
+
+def KCC(window):
+    features['KCC_'+str(window)] = ta.volatility.keltner_channel_central(features['High'], features['Low'], features['Adj Close'], n=window, fillna=False)
+    
+def KCHB(window):
+    features['KCHB_'+str(window)] = ta.volatility.keltner_channel_hband(features['High'], features['Low'], features['Adj Close'], n=window, fillna=False)
+    
+def KCLB(window):
+    features['KCLB_'+str(window)] = ta.volatility.keltner_channel_lband(features['High'], features['Low'], features['Adj Close'], n=window, fillna=False)
+    
+def ADXP(window):
+    features['ADXP_'+str(window)] = ta.trend.adx_neg(features['High'], features['Low'], features['Adj Close'], n=window, fillna=False)
+
+def AID(window):    
+    features['AID_'+str(window)] = ta.trend.aroon_down(features['Adj Close'], n=window, fillna=False)
+    
+def AIU(window):    
+    features['AIU_'+str(window)] = ta.trend.aroon_up(features['Adj Close'], n=window, fillna=False)
+    
+def CCI(window):
+    features['CCI_'+str(window)] = ta.trend.cci(features['High'], features['Low'], features['Adj Close'], n=window, c=0.015, fillna=False)
+    
+def DPO(window):
+    features['DPO_'+str(window)] = ta.trend.dpo(features['Adj Close'], n=window, fillna=False)
+    
+def ICH_A(window1,window2):
+    features['ICH_A_'+str(window1)+'_'+str(window2)] = ta.trend.ichimoku_a(features['High'], features['Low'], n1=window1, n2=window2, visual=False, fillna=False)
+    
+def ICH_B(window1,window2):
+    features['ICH_B_'+str(window1)+'_'+str(window2)] = ta.trend.ichimoku_b(features['High'], features['Low'], n2=window1, n3=window2, visual=False, fillna=False)
+
+
+# ## Fixed Parameter Features
+
+# In[5]:
+
+
+features['STO_OS'] = ta.momentum.stoch(features['High'], features['Low'], features['Adj Close'], n=14, fillna=False)
+features['WillR'] = ta.momentum.wr(features['High'], features['Low'], features['Adj Close'], lbp=14, fillna=False)
+features['MACD'] = ExpMovingAvg(features['Adj Close'],12) - ExpMovingAvg(features['Adj Close'],26)
+features['SIG_LI'] = ExpMovingAvg(features['MACD'],9)
+features['AO'] = ta.momentum.ao(features['High'], features['Low'], s=5, len=34, fillna=False)
+features['VPT'] = ta.volume.volume_price_trend(features['Adj Close'], features['Volume'], fillna=False)
+features['NVI'] = ta.volume.negative_volume_index(features['Adj Close'], features['Volume'], fillna=False)
+features['ADI'] = ta.volume.acc_dist_index(features['High'], features['Low'], features['Adj Close'], features['Volume'], fillna=False)
+features['KST'] = ta.trend.kst(features['Adj Close'], r1=10, r2=15, r3=20, r4=30, n1=10, n2=10, n3=10, n4=15, fillna=False)
+
+
+# ## Randomly Generated Features
+
+# In[6]:
+
+
+functions = [MA,STO_SIG,EMA,PROC,RSISMA,UB,DB,CMF,EMV,FI,BBHB,BBLB,BBMA,ROI,DCHB,DCLB,KCC,KCHB,KCLB,AID,AIU,CCI,DPO]
+
+def Randomize_feature(number_of_features):
+    for n in range(number_of_features):
+        i = random.randint(0,len(functions)-1)
+        window = random.randint(2,120) #number of periods(days)
+        functions[i](window)
+
+
+# In[7]:
+
+
+Randomize_feature(50)
+
+
+# In[8]:
+
+
+features['target'] = target(features['Adj Close'])
+
+
+# In[9]:
+
+
+features = features.dropna()
+
+
+# ## Data Preprocessing
+
+# In[10]:
+
+
+#Standardized Dataset
+features_target = features.loc[:,'AdrActCnt':'target']
+target = features_target['target']
+All_features = features_target.drop(columns = ['target'])
+Y, X = target,All_features
+scaler = MinMaxScaler().fit(X)
+rescaledX = scaler.transform(X)
+X = pd.DataFrame(rescaledX, index = X.index, columns = X.columns)
+Y = pd.DataFrame(Y, index = Y.index)
+Y['Close']=features['Close']
+
+
+# # Feature Importance
+
+# In[11]:
+
+
+##Feature Importance
+model = ensemble.ExtraTreesClassifier(n_estimators=100)
+model.fit(X,Y['target'])
+#print(model.feature_importances_) #use inbuilt class feature_importances of tree based classifiers
+#plot graph of feature importances for better visualization
+#plt.figure(figsize=(20,20))
+feat_importances = pd.Series(model.feature_importances_, index=X.columns)
+#feat_importances.nsmallest(len(X.columns)).plot(kind='barh')
+#plt.show()
+feat_importances = feat_importances.sort_values(ascending=False).iloc[:30]
+df1 = feat_importances
+df1
+
+
+# In[12]:
+
+
+##Feature Importance
+model = ensemble.RandomForestClassifier(n_estimators=100)
+model.fit(X,Y['target'])
+#print(model.feature_importances_) #use inbuilt class feature_importances of tree based classifiers
+#plot graph of feature importances for better visualization
+#plt.figure(figsize=(20,20))
+feat_importances = pd.Series(model.feature_importances_, index=X.columns)
+#feat_importances.nsmallest(len(X.columns)).plot(kind='barh')
+#plt.show()
+feat_importances = feat_importances.sort_values(ascending=False).iloc[:30]
+df2=feat_importances
+df1.index.intersection(df2.index)
+
+
+# # Top 20 best features
+
+# In[13]:
+
+
+#chi-squared (chi²) statistical test for non-negative features to select 10 of the best features from the Mobile Price Range Prediction Dataset.
+#apply SelectKBest class to extract top 10 best features
+bestfeatures = SelectKBest(score_func=chi2,k=10)
+fit = bestfeatures.fit(X,Y['target'])
+dfscores = pd.DataFrame(fit.scores_)
+dfcolumns = pd.DataFrame(X.columns)
+#concat two dataframes for better visualization 
+featureScores = pd.concat([dfcolumns,dfscores],axis=1)
+featureScores.columns = ['Specs','Score']  #naming the dataframe columns
+print(featureScores.nlargest(20,'Score'))  #print 10 best features
+
+
+# # Heat Map Correlation Matrix 
+
+# In[14]:
+
+
+#Can be used after 
+#get correlations of each features in dataset
+corrmat = features_target.corr()
+corr_features = corrmat.index
+plt.figure(figsize=(35,35))
+#plot heat map
+g=sns.heatmap(features_target.corr(),annot=True,cmap="RdYlGn")
+
+
+# # Principle Component Analysis 
+
+# In[15]:
+
+
+#We keep 25 components to make sure the sum of explained variation of the principal components is close to 98%
+#To improve accuracy and efficiency
+pca = PCA(n_components=25)
+X = pd.DataFrame(pca.fit_transform(X),index=X.index)
+print('Explained variation per principal component: {}'.format(pca.explained_variance_ratio_))
+print('Sum of Explained variation of principal component: {}'.format(sum(pca.explained_variance_ratio_)))
+
+
+# # Training Data Preparation
+
+# In[16]:
+
+
+#Data Set Preparation 
+X_test = X.iloc[int(len(X.index)*0.6):]
+X_train = X.iloc[:int(len(X.index)*0.6)]
+y_test = Y.iloc[int(len(Y.index)*0.6):]
+Y_train = Y.iloc[:int(len(Y.index)*0.6)]
+X_train, X_val, y_train, y_val = train_test_split(X_train, Y_train, test_size=0.3,random_state=42)
+
+
+# In[17]:
+
+
+print (X_train.shape, y_train.shape)
+print (X_val.shape, y_val.shape)
+print (X_test.shape, y_test.shape)
+
+
+# In[18]:
+
+
+def modelfit(alg, X, Y, performCV=True, printFeatureImportance=True, cv_folds=5):
+    #Fit the algorithm on the data
+    alg.fit(X, Y)
+        
+    #Predict training set:
+    dtrain_predictions = alg.predict(X)
+    dtrain_predprob = alg.predict_proba(X)[:,1]
+    
+    #Perform cross-validation:
+    if performCV:
+        cv_score = cross_val_score(alg, X, Y, cv=cv_folds, scoring='roc_auc')
+    
+    #Print model report:
+    print ("\nModel Report")
+    print ("Accuracy : %.4g" % metrics.accuracy_score(Y.values, dtrain_predictions))
+    print ("AUC Score (Train): %f" % metrics.roc_auc_score(Y, dtrain_predprob))
+    
+    if performCV:
+        print ("CV Score : Mean - %.7g | Std - %.7g | Min - %.7g | Max - %.7g" % (np.mean(cv_score),np.std(cv_score),np.min(cv_score),np.max(cv_score)))
+        
+    #Print Feature Importance:
+    if printFeatureImportance:
+        feat_imp = pd.Series(alg.feature_importances_).sort_values(ascending=False)
+        plt.figure(figsize=(10,10))
+        feat_imp.plot(kind='bar', title='Feature Importances')
+        plt.ylabel('Feature Importance Score')
+
+
+# # PCA Model
+
+# In[19]:
+
+
+#XGBoost Hyperparameters tuning 
+#creating a baseline model without tuning (assuming initial values)
+XGB0 = XGBClassifier(learning_rate =0.1, n_estimators=1000, max_depth=5, min_child_weight=1, gamma=0,
+ subsample=0.8,colsample_bytree=0.8,objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB0, X_train, y_train['target'])
+
+
+# In[20]:
+
+
+#XGBoost: learning_rate, n_estimators
+param_test1 = {
+    'learning_rate':[0.0001,0.01,0.1],
+    'n_estimators':[100,200,500,800,1000]
+}
+gsearch1 = GridSearchCV(estimator = XGBClassifier(max_depth=5, min_child_weight=1, gamma=0, subsample=0.8, colsample_bytree=0.8,objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27),param_grid = param_test1, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch1.fit(X_train, y_train['target'])
+gsearch1.best_params_, gsearch1.best_score_
+
+
+# In[21]:
+
+
+#XGBoost: learning_rate, n_estimators; further testing 
+param_test1b = {
+    'learning_rate':[0.0001,0.005,0.001],
+    'n_estimators':[100,200,300,400]
+}
+gsearch1b = GridSearchCV(estimator = XGBClassifier(max_depth=5, min_child_weight=1, gamma=0, subsample=0.8, colsample_bytree=0.8,objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27),param_grid = param_test1b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch1b.fit(X_train, y_train['target'])
+gsearch1b.best_params_, gsearch1b.best_score_
+
+
+# In[22]:
+
+
+#XGBoost: max_depth, min_child_weight
+param_test2 = {
+ 'max_depth':range(3,10,2),
+ 'min_child_weight':range(1,6,2)
+}
+gsearch2 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.005, n_estimators=100, gamma=0, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27), 
+ param_grid = param_test2, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch2.fit(X_train, y_train['target'])
+gsearch2.best_params_, gsearch2.best_score_
+
+
+# In[23]:
+
+
+#XGBoost: max_depth, min_child_weight (step#2 further specify)
+param_test2b = {
+ 'max_depth':[2,3,4],
+ 'min_child_weight':[1,2,3]
+}
+gsearch2b = GridSearchCV(estimator = XGBClassifier(learning_rate =0.005, n_estimators=100, gamma=0, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27), 
+ param_grid = param_test2b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch2b.fit(X_train, y_train['target'])
+gsearch2b.best_params_, gsearch2b.best_score_
+
+
+# In[24]:
+
+
+#XGBoost: gamma
+param_test3 = {
+ 'gamma':[i/10.0 for i in range(0,10)]
+}
+gsearch3 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.005, n_estimators=100, max_depth=3,
+ min_child_weight=1, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test3, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch3.fit(X_train, y_train['target'])
+gsearch3.best_params_, gsearch3.best_score_
+
+
+# In[25]:
+
+
+#XGBoost: subsample, colsample_bytree
+param_test4 = {
+ 'subsample':[i/10.0 for i in range(6,10)],
+ 'colsample_bytree':[i/10.0 for i in range(6,10)]
+}
+gsearch4 = GridSearchCV(estimator = XGBClassifier( learning_rate =0.005, n_estimators=100, max_depth=3,
+ min_child_weight=1, gamma=0.9, objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test4, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch4.fit(X_train, y_train['target'])
+gsearch4.best_params_, gsearch4.best_score_
+
+
+# In[27]:
+
+
+#XGBoost: subsample, colsample_bytree (step#2)
+param_test4b = {
+ 'subsample':[i/100.0 for i in range(75,85,5)],
+ 'colsample_bytree':[i/100.0 for i in range(75,85,5)]
+}
+gsearch4b = GridSearchCV(estimator = XGBClassifier( learning_rate =0.005, n_estimators=100, max_depth=3,
+ min_child_weight=1, gamma=0.9, objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test4b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch4b.fit(X_train, y_train['target'])
+gsearch4b.best_params_, gsearch4b.best_score_
+
+
+# In[28]:
+
+
+#XGBoost: reg_alpha
+param_test5 = {
+ 'reg_alpha':[1e-5, 1e-2, 0.1, 1, 100]
+}
+gsearch5 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.005, n_estimators=100, max_depth=3,
+ min_child_weight=1, gamma=0.9, subsample=0.8, colsample_bytree=0.75,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test5, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch5.fit(X_train, y_train['target'])
+gsearch5.best_params_, gsearch5.best_score_
+
+
+# In[29]:
+
+
+XGB1 = XGBClassifier(learning_rate=0.005, n_estimators=100, max_depth=3, min_child_weight=1, gamma=0.9,
+ subsample=0.8,colsample_bytree=0.75,reg_alpha=1, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB1, X_train, y_train['target'])
+
+
+# In[30]:
+
+
+XGB2 = XGBClassifier(learning_rate=0.001, n_estimators=200, max_depth=3, min_child_weight=1, gamma=0.9,
+ subsample=0.8,colsample_bytree=0.75,reg_alpha=1, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB2, X_train, y_train['target'])
+
+
+# In[32]:
+
+
+XGB3 = XGBClassifier(learning_rate=0.0005, n_estimators=1000, max_depth=3, min_child_weight=1, gamma=0.9,
+ subsample=0.8,colsample_bytree=0.75,reg_alpha=1, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB3, X_train, y_train['target'])
+
+# since after parameter tuning, XGB1 has the best overall performance in Cross-validation score (CV score) and AUC score, we will use XGB1 as our prediction model. 
+# In[33]:
+
+
+#Default XGBoost
+x_prediction = X_val
+model = XGBClassifier()        
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+
+
+# In[34]:
+
+
+#Initial XGB0
+x_prediction = X_val
+model = XGB0        
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+
+
+# In[36]:
+
+
+#XBG1
+x_prediction = X_val
+model = XGB1    
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+x_prediction = X_test
+y_prediction = model.predict(x_prediction)
+results = y_prediction
+prob = pd.DataFrame(data={'PCA prediction': results},index=X_test.index)
+Close = pd.DataFrame(data={'PCA Close': y_test['Close']})
+prob = prob.join(Close)
+prob
+
+# Since the overall performance of XGB1 is better than both inital XGB0 and Default XGB, we pick XGB1 as our prediction model# PCA Performance
+# In[37]:
+
+
+#assuming zero risk free rate
+#sharpe ratio 
+#max drawdown
+#absolute return
+performance_df = pd.DataFrame(index=['Sharpe Ratio','Max Drawdown','Absolute return'])
+def performance(prediction, close):
+    Investment=[]
+    Capital=[]
+    for i in range(len(prediction)):
+        if i==0 and prediction.iloc[i]==1:
+            Capital.append(close.iloc[i])
+        if i>0 and prediction.iloc[i-1]==0 and prediction.iloc[i]==1:
+            Capital.append(close.iloc[i])
+        if i>0 and prediction.iloc[i-1]==1 and prediction.iloc[i]==0:
+            Investment.append(close.iloc[i])
+        if i==len(prediction)-1 and prediction.iloc[i]==1:
+            Investment.append(close.iloc[i])
+    absolute_return=np.log(np.sum(Investment)/np.sum(Capital))
+    returns = pd.DataFrame(np.log(np.array(Investment)/np.array(Capital))).replace([np.inf, -np.inf], np.nan).dropna()
+    avg_return = float(np.mean(returns))
+    std = float(np.std(returns))
+    SR = avg_return/std
+    max_drawdown = (min(close)-max(close))/max(close)
+    return SR, max_drawdown, absolute_return
+results = performance(prob['PCA prediction'],prob['PCA Close'])
+performance_df['PCA'] = results
+performance_df
+
+
+# # Benchmark learning (all features included)
+
+# In[38]:
+
+
+features_target = features.loc[:,'AdrActCnt':'target']
+target = features_target['target']
+All_features = features_target.drop(columns = ['target'])
+Y, X = target,All_features
+scaler = MinMaxScaler().fit(X)
+rescaledX = scaler.transform(X)
+X = pd.DataFrame(rescaledX, index = X.index, columns = X.columns)
+Y = pd.DataFrame(Y, index = Y.index)
+Y['Close']=features['Close']
+
+
+# In[39]:
+
+
+#Data Set Preparation 
+X_test = X.iloc[int(len(X.index)*0.6):]
+X_train = X.iloc[:int(len(X.index)*0.6)]
+y_test = Y.iloc[int(len(Y.index)*0.6):]
+Y_train = Y.iloc[:int(len(Y.index)*0.6)]
+X_train, X_val, y_train, y_val = train_test_split(X_train, Y_train, test_size=0.3,random_state=42)
+
+
+# In[40]:
+
+
+print (X_train.shape, y_train.shape)
+print (X_val.shape, y_val.shape)
+print (X_test.shape, y_test.shape)
+
+
+# In[41]:
+
+
+#XGBoost Hyperparameters tuning 
+#creating a baseline model without tuning (assuming initial values)
+XGB0 = XGBClassifier(learning_rate =0.1, n_estimators=1000, max_depth=5, min_child_weight=1, gamma=0,
+ subsample=0.8,colsample_bytree=0.8,objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB0, X_train, y_train['target'])
+
+
+# In[43]:
+
+
+#XGBoost: n_estimators
+param_test1 = {
+    'learning_rate':[0.0001,0.01,0.1],
+    'n_estimators':[100,200,500,800,1000]
+}
+gsearch1 = GridSearchCV(estimator = XGBClassifier(max_depth=5, min_child_weight=1, gamma=0, subsample=0.8, colsample_bytree=0.8,objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27),param_grid = param_test1, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch1.fit(X_train, y_train['target'])
+gsearch1.best_params_, gsearch1.best_score_
+
+
+# In[44]:
+
+
+#XGBoost: n_estimators; further testing 
+param_test1b = {
+ 'learning_rate':[0.001,0.005,0.01],
+'n_estimators':[300,400,500,600]
+}
+gsearch1b = GridSearchCV(estimator = XGBClassifier(max_depth=5, min_child_weight=1, gamma=0, subsample=0.8, colsample_bytree=0.8,objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27),param_grid = param_test1b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch1b.fit(X_train, y_train['target'])
+gsearch1b.best_params_, gsearch1b.best_score_
+
+
+# In[45]:
+
+
+#XGBoost: max_depth, min_child_weight
+param_test2 = {
+ 'max_depth':range(3,10,2),
+ 'min_child_weight':range(1,6,2)
+}
+gsearch2 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.01, n_estimators=400, gamma=0, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27), 
+ param_grid = param_test2, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch2.fit(X_train, y_train['target'])
+gsearch2.best_params_, gsearch2.best_score_
+
+
+# In[46]:
+
+
+#XGBoost: max_depth, min_child_weight (step#2 further specify)
+param_test2b = {
+ 'max_depth':[2,3,4],
+ 'min_child_weight':[1,2,3]
+}
+gsearch2b = GridSearchCV(estimator = XGBClassifier(learning_rate =0.01, n_estimators=400, gamma=0, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27), 
+ param_grid = param_test2b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch2b.fit(X_train, y_train['target'])
+gsearch2b.best_params_, gsearch2b.best_score_
+
+
+# In[47]:
+
+
+#XGBoost: gamma
+param_test3 = {
+ 'gamma':[i/10.0 for i in range(0,5)]
+}
+gsearch3 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.01, n_estimators=400, max_depth=4,
+ min_child_weight=2, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test3, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch3.fit(X_train, y_train['target'])
+gsearch3.best_params_, gsearch3.best_score_
+
+
+# In[48]:
+
+
+#XGBoost: subsample, colsample_bytree
+param_test4 = {
+ 'subsample':[i/10.0 for i in range(6,10)],
+ 'colsample_bytree':[i/10.0 for i in range(6,10)]
+}
+gsearch4 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.01, n_estimators=400, max_depth=4,
+ min_child_weight=2, gamma=0.1, objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test4, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch4.fit(X_train, y_train['target'])
+gsearch4.best_params_, gsearch4.best_score_
+
+
+# In[49]:
+
+
+#XGBoost: subsample, colsample_bytree
+param_test4b = {
+ 'subsample':[i/100.0 for i in range(85,95,5)],
+ 'colsample_bytree':[i/100.0 for i in range(85,95,5)]
+}
+gsearch4b = GridSearchCV(estimator = XGBClassifier(learning_rate =0.01, n_estimators=400, max_depth=4,
+ min_child_weight=2, gamma=0.1, objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test4b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch4b.fit(X_train, y_train['target'])
+gsearch4b.best_params_, gsearch4b.best_score_
+
+
+# In[50]:
+
+
+#XGBoost: reg_alpha
+param_test5 = {
+ 'reg_alpha':[1e-5, 1e-2, 0.1, 1, 100]
+}
+gsearch5 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.01, n_estimators=400, max_depth=4,
+ min_child_weight=2, gamma=0.1, subsample=0.9, colsample_bytree=0.9,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test5, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch5.fit(X_train, y_train['target'])
+gsearch5.best_params_, gsearch5.best_score_
+
+
+# In[51]:
+
+
+#XGBoost: reg_alpha (step#2)
+param_test5b = {
+ 'reg_alpha':[1e-6,1e-5,1e-4,1e-3]
+}
+gsearch5b = GridSearchCV(estimator = XGBClassifier(learning_rate =0.01, n_estimators=400, max_depth=4,
+ min_child_weight=2, gamma=0.1, subsample=0.9, colsample_bytree=0.9,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test5, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch5b.fit(X_train, y_train['target'])
+gsearch5b.best_params_, gsearch5.best_score_
+
+
+# In[52]:
+
+
+XGB1 = XGBClassifier(learning_rate=0.01, n_estimators=400, max_depth=4, min_child_weight=2, gamma=0.1,
+ subsample=0.9,colsample_bytree=0.9,reg_alpha=1e-5, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB1, X_train, y_train['target'])
+
+
+# In[53]:
+
+
+XGB2 = XGBClassifier(learning_rate=0.005, n_estimators=800, max_depth=4, min_child_weight=2, gamma=0.1,
+ subsample=0.9,colsample_bytree=0.9,reg_alpha=1e-5, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB2, X_train, y_train['target'])
+
+
+# In[54]:
+
+
+XGB3 = XGBClassifier(learning_rate=0.0025, n_estimators=1600, max_depth=4, min_child_weight=2, gamma=0.1,
+ subsample=0.9,colsample_bytree=0.9,reg_alpha=1e-5, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB3, X_train, y_train['target'])
+
+
+# #since XGB1 has the overall best performance out of all models in terms of AUC and CV scores, we will pick XGB1 as our prediction model
+
+# In[55]:
+
+
+#Default XGBoost
+x_prediction = X_val
+model = XGBClassifier()        
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+
+
+# In[56]:
+
+
+#Initial XGB0
+x_prediction = X_val
+model = XGB0        
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+print('\n')
+
+
+# In[58]:
+
+
+#XGB1
+x_prediction = X_val
+model = XGB1       
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+print('\n')
+x_prediction = X_test
+y_prediction = model.predict(x_prediction)
+results = y_prediction
+prob = pd.DataFrame(data={'Bench prediction': results},index=X_test.index)
+Close = pd.DataFrame(data={'Bench Close': y_test['Close']})
+prob = prob.join(Close)
+prob
+
+# We will pick XGB1 as our prediction model, since it performs with better accuracy and lower validation logloss.# Benchmark Performance
+# In[59]:
+
+
+#assuming zero risk free rate
+#sharpe ratio 
+#max drawdown
+#absolute return
+results = performance(prob['Bench prediction'],prob['Bench Close'])
+performance_df['Benchmark'] = results
+performance_df
+
+
+# # PCA-DWT
+
+# In[60]:
+
+
+features_target = features.loc[:,'AdrActCnt':'target']
+target = features_target['target']
+All_features = features_target.drop(columns = ['target'])
+Y, X = target,All_features
+scaler = MinMaxScaler().fit(X)
+rescaledX = scaler.transform(X)
+X = pd.DataFrame(rescaledX, index = X.index, columns = X.columns)
+Y = pd.DataFrame(Y, index = Y.index)
+Y['Close']=features['Close']
+
+
+# In[61]:
+
+
+#We keep 25 components to make sure the sum of explained variation of the principal components is close to 98%
+#To improve accuracy and efficiency
+pca = PCA(n_components=25)
+X = pd.DataFrame(pca.fit_transform(X),index=X.index)
+print('Explained variation per principal component: {}'.format(pca.explained_variance_ratio_))
+print('Sum of Explained variation of principal component: {}'.format(sum(pca.explained_variance_ratio_)))
+
+
+# In[62]:
+
+
+import pywt
+coeffs = pywt.wavedec(X, 'db2', level=3)
+X = pywt.waverec(coeffs, 'db2')
+ 
+fig, ax = plt.subplots(figsize=(30,20))
+ax.plot(X[:1000], label='signal')
+ax.plot(X[:1000], label='reconstructed signal', linestyle='--')
+ax.legend(loc='upper left')
+ax.set_title('de- and reconstruction using wavedec()')
+plt.show()
+
+
+# In[63]:
+
+
+#Data Set Preparation 
+X_test = X[int(len(X)*0.6):]
+X_train = X[:int(len(X)*0.6)]
+y_test = Y[int(len(Y)*0.6):]
+Y_train = Y[:int(len(Y)*0.6)]
+X_train, X_val, y_train, y_val = train_test_split(X_train, Y_train, test_size=0.3,random_state=42)
+
+
+# In[64]:
+
+
+print (X_train.shape, y_train.shape)
+print (X_val.shape, y_val.shape)
+print (X_test.shape, y_test.shape)
+
+
+# In[65]:
+
+
+#XGBoost Hyperparameters tuning 
+#creating a baseline model without tuning (assuming initial values)
+XGB0 = XGBClassifier(learning_rate =0.1, n_estimators=1000, max_depth=5, min_child_weight=1, gamma=0,
+ subsample=0.8,colsample_bytree=0.8,objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB0, X_train, y_train['target'])
+
+
+# In[66]:
+
+
+#XGBoost: n_estimators
+param_test1 = {
+    'learning_rate':[0.0001,0.01,0.1],
+    'n_estimators':[100,200,500,800,1000]
+}
+gsearch1 = GridSearchCV(estimator = XGBClassifier(max_depth=5, min_child_weight=1, gamma=0, subsample=0.8, colsample_bytree=0.8,objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27),param_grid = param_test1, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch1.fit(X_train, y_train['target'])
+gsearch1.best_params_, gsearch1.best_score_
+
+
+# In[67]:
+
+
+#XGBoost: n_estimators; further testing 
+param_test1b = {
+    'learning_rate':[0.0001,0.001,0.005],
+    'n_estimators':[100]
+}
+gsearch1b = GridSearchCV(estimator = XGBClassifier(learning_rate =0.1, max_depth=5, min_child_weight=1, gamma=0, subsample=0.8, colsample_bytree=0.8,objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27),param_grid = param_test1b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch1b.fit(X_train, y_train['target'])
+gsearch1b.best_params_, gsearch1b.best_score_
+
+
+# In[68]:
+
+
+#XGBoost: max_depth, min_child_weight
+param_test2 = {
+ 'max_depth':range(3,10,2),
+ 'min_child_weight':range(1,6,2)
+}
+gsearch2 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.0001, n_estimators=100, gamma=0, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27), 
+ param_grid = param_test2, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch2.fit(X_train, y_train['target'])
+gsearch2.best_params_, gsearch2.best_score_
+
+
+# In[69]:
+
+
+#XGBoost: max_depth, min_child_weight (step#2 further specify)
+param_test2b = {
+ 'max_depth':[2,3,4],
+ 'min_child_weight':[4,5,6]
+}
+gsearch2b = GridSearchCV(estimator = XGBClassifier(learning_rate =0.0001, n_estimators=100, gamma=0, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1, seed=27), 
+ param_grid = param_test2b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch2b.fit(X_train, y_train['target'])
+gsearch2b.best_params_, gsearch2b.best_score_
+
+
+# In[70]:
+
+
+#XGBoost: gamma
+param_test3 = {
+ 'gamma':[i/10.0 for i in range(0,5)]
+}
+gsearch3 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.0001, n_estimators=100, max_depth=3,
+ min_child_weight=6, subsample=0.8, colsample_bytree=0.8,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test3, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch3.fit(X_train, y_train['target'])
+gsearch3.best_params_, gsearch3.best_score_
+
+
+# In[71]:
+
+
+#XGBoost: subsample, colsample_bytree
+param_test4 = {
+ 'subsample':[i/10.0 for i in range(6,10)],
+ 'colsample_bytree':[i/10.0 for i in range(6,10)]
+}
+gsearch4 = GridSearchCV(estimator = XGBClassifier( learning_rate =0.0001, n_estimators=100, max_depth=3,
+ min_child_weight=6, gamma=0.3, objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test4, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch4.fit(X_train, y_train['target'])
+gsearch4.best_params_, gsearch4.best_score_
+
+
+# In[72]:
+
+
+#XGBoost: subsample, colsample_bytree (step#2)
+param_test4b = {
+ 'subsample':[i/100.0 for i in range(55,65,5)],
+ 'colsample_bytree':[i/100.0 for i in range(85,95,5)]
+}
+gsearch4b = GridSearchCV(estimator = XGBClassifier( learning_rate =0.0001, n_estimators=100, max_depth=3,
+ min_child_weight=6, gamma=0.3, objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test4b, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch4b.fit(X_train, y_train['target'])
+gsearch4b.best_params_, gsearch4b.best_score_
+
+
+# In[73]:
+
+
+#XGBoost: reg_alpha
+param_test5 = {
+ 'reg_alpha':[1e-5, 1e-2, 0.1, 1, 100]
+}
+gsearch5 = GridSearchCV(estimator = XGBClassifier(learning_rate =0.0001, n_estimators=100, max_depth=3,
+ min_child_weight=6, gamma=0.3, subsample=0.55, colsample_bytree=0.9,
+ objective= 'binary:logistic', nthread=4, scale_pos_weight=1,seed=27), 
+ param_grid = param_test5, scoring='roc_auc',n_jobs=-1,iid=False, cv=5)
+gsearch5.fit(X_train, y_train['target'])
+gsearch5.best_params_, gsearch5.best_score_
+
+
+# In[74]:
+
+
+XGB1 = XGBClassifier(learning_rate=0.0001, n_estimators=100, max_depth=3, min_child_weight=6, gamma=0.3,
+ subsample=0.55,colsample_bytree=0.9,reg_alpha=1e-5, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB1, X_train, y_train['target'])
+
+
+# In[75]:
+
+
+XGB2 = XGBClassifier(learning_rate=0.00005, n_estimators=200, max_depth=3, min_child_weight=6, gamma=0.3,
+ subsample=0.55,colsample_bytree=0.9,reg_alpha=1e-5, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB2, X_train, y_train['target'])
+
+
+# In[76]:
+
+
+XGB3 = XGBClassifier(learning_rate=0.00001, n_estimators=1000, max_depth=3, min_child_weight=6, gamma=0.3,
+ subsample=0.55,colsample_bytree=0.9,reg_alpha=1e-5, objective='binary:logistic',nthread=4,scale_pos_weight=1,seed=27)
+modelfit(XGB3, X_train, y_train['target'])
+
+# since XGB2 has overll better performance, we will use XGB2 as the prediction model. 
+# In[82]:
+
+
+#Default XGBoost
+x_prediction = X_val
+model = XGBClassifier()        
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+x_prediction = X_test
+y_prediction = model.predict(x_prediction)
+results = y_prediction
+prob = pd.DataFrame(data={'PCA_DWT prediction': results},index=y_test.index)
+Close = pd.DataFrame(data={'PCA_DWT Close': y_test['Close']})
+prob = prob.join(Close)
+prob
+
+
+# In[78]:
+
+
+#Initial XGB0
+x_prediction = X_val
+model = XGB0        
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+print('\n')
+
+
+# In[81]:
+
+
+#XGB2
+x_prediction = X_val
+model = XGB2
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+print('\n')
+
+
+# #since default xgboost performs better with higher accuracy and lower validation loss, we will pick default xgboost as our predicition model.
+
+# In[83]:
+
+
+results = performance(prob['PCA_DWT prediction'],prob['PCA_DWT Close'])
+performance_df['PCA_DWT'] = results
+performance_df
+
+
+# # SGD
+
+# In[91]:
+
+
+features_target = features.loc[:,'AdrActCnt':'target']
+target = features_target['target']
+All_features = features_target.drop(columns = ['target'])
+Y, X = target,All_features
+scaler = MinMaxScaler().fit(X)
+rescaledX = scaler.transform(X)
+X = pd.DataFrame(rescaledX, index = X.index, columns = X.columns)
+Y = pd.DataFrame(Y, index = Y.index)
+Y['Close']=features['Close']
+
+
+# In[92]:
+
+
+#Data Set Preparation 
+X_test = X[int(len(X)*0.6):]
+X_train = X[:int(len(X)*0.6)]
+y_test = Y[int(len(Y)*0.6):]
+Y_train = Y[:int(len(Y)*0.6)]
+X_train, X_val, y_train, y_val = train_test_split(X_train, Y_train, test_size=0.3,random_state=42)
+
+print (X_train.shape, y_train.shape)
+print (X_val.shape, y_val.shape)
+
+
+# In[93]:
+
+
+from sklearn.model_selection import ParameterGrid
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import roc_auc_score
+import parfit.parfit as pf
+
+grid = {
+    'alpha': [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3], # learning rate
+    'n_iter': [1000], # number of epochs
+    'loss': ['log'], # logistic regression,
+    'penalty': ['l2'],
+    'n_jobs': [-1]
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(SGDClassifier, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[94]:
+
+
+#Best SGD
+x_prediction = X_val
+model = bestModel
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+print('\n')
+x_prediction = X_test
+y_prediction = model.predict(x_prediction)
+results = y_prediction
+prob = pd.DataFrame(data={'SGD prediction': results},index=y_test.index)
+Close = pd.DataFrame(data={'SGD Close': y_test['Close']})
+prob = prob.join(Close)
+prob
+
+
+# In[95]:
+
+
+results = performance(prob['SGD prediction'],prob['SGD Close'])
+performance_df['SGD'] = results
+performance_df
+
+
+# # SGD-PCA
+
+# In[96]:
+
+
+features_target = features.loc[:,'AdrActCnt':'target']
+target = features_target['target']
+All_features = features_target.drop(columns = ['target'])
+Y, X = target,All_features
+scaler = MinMaxScaler().fit(X)
+rescaledX = scaler.transform(X)
+X = pd.DataFrame(rescaledX, index = X.index, columns = X.columns)
+Y = pd.DataFrame(Y, index = Y.index)
+Y['Close']=features['Close']
+
+
+# In[97]:
+
+
+#We keep 25 components to make sure the sum of explained variation of the principal components is close to 98%
+#To improve accuracy and efficiency
+pca = PCA(n_components=25)
+X = pd.DataFrame(pca.fit_transform(X),index=X.index)
+print('Explained variation per principal component: {}'.format(pca.explained_variance_ratio_))
+print('Sum of Explained variation of principal component: {}'.format(sum(pca.explained_variance_ratio_)))
+
+
+# In[98]:
+
+
+#Data Set Preparation 
+X_test = X[int(len(X)*0.6):]
+X_train = X[:int(len(X)*0.6)]
+y_test = Y[int(len(Y)*0.6):]
+Y_train = Y[:int(len(Y)*0.6)]
+X_train, X_val, y_train, y_val = train_test_split(X_train, Y_train, test_size=0.3,random_state=42)
+
+print (X_train.shape, y_train.shape)
+print (X_val.shape, y_val.shape)
+
+
+# In[99]:
+
+
+grid = {
+    'alpha': [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3], # learning rate
+    'n_iter': [1000], # number of epochs
+    'loss': ['log'], # logistic regression,
+    'penalty': ['l2'],
+    'n_jobs': [-1]
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(SGDClassifier, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[100]:
+
+
+#Best SGD
+x_prediction = X_val
+model = bestModel
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+print('\n')
+x_prediction = X_test
+y_prediction = model.predict(x_prediction)
+results = y_prediction
+prob = pd.DataFrame(data={'SGD_PCA prediction': results},index=y_test.index)
+Close = pd.DataFrame(data={'SGD_PCA Close': y_test['Close']})
+prob = prob.join(Close)
+prob
+
+
+# In[101]:
+
+
+results = performance(prob['SGD_PCA prediction'],prob['SGD_PCA Close'])
+performance_df['SGD_PCA'] = results
+performance_df
+
+
+# In[102]:
+
+
+performance_df = performance_df[['Benchmark','PCA','PCA_DWT','SGD','SGD_PCA']]
+performance_df
+
+
+# # SVC
+
+# In[103]:
+
+
+features_target = features.loc[:,'AdrActCnt':'target']
+target = features_target['target']
+All_features = features_target.drop(columns = ['target'])
+Y, X = target,All_features
+scaler = MinMaxScaler().fit(X)
+rescaledX = scaler.transform(X)
+X = pd.DataFrame(rescaledX, index = X.index, columns = X.columns)
+Y = pd.DataFrame(Y, index = Y.index)
+Y['Close']=features['Close']
+
+
+# In[104]:
+
+
+#Data Set Preparation 
+X_test = X[int(len(X)*0.6):]
+X_train = X[:int(len(X)*0.6)]
+y_test = Y[int(len(Y)*0.6):]
+Y_train = Y[:int(len(Y)*0.6)]
+X_train, X_val, y_train, y_val = train_test_split(X_train, Y_train, test_size=0.3,random_state=42)
+
+print (X_train.shape, y_train.shape)
+print (X_val.shape, y_val.shape)
+
+
+# In[105]:
+
+
+from sklearn.svm import SVC
+grid = {
+    'kernel': ['linear','rbf','poly'],
+    'gamma' : [0.1,1,10,100],
+    'C': [0.1,1,10,100,1000],
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(SVC, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[106]:
+
+
+#Best SVC
+model = bestModel
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+x_prediction = X_test
+y_prediction = model.predict(x_prediction)
+results = y_prediction
+prob = pd.DataFrame(data={'SVC prediction': results},index=y_test.index)
+Close = pd.DataFrame(data={'SVC Close': y_test['Close']})
+prob = prob.join(Close)
+
+
+# In[107]:
+
+
+results = performance(prob['SVC prediction'],prob['SVC Close'])
+performance_df['SVC'] = results
+performance_df
+
+
+# # XGB_new
+
+# In[108]:
+
+
+features_target = features.loc[:,'AdrActCnt':'target']
+target = features_target['target']
+All_features = features_target.drop(columns = ['target'])
+Y, X = target,All_features
+scaler = MinMaxScaler().fit(X)
+rescaledX = scaler.transform(X)
+X = pd.DataFrame(rescaledX, index = X.index, columns = X.columns)
+Y = pd.DataFrame(Y, index = Y.index)
+Y['Close']=features['Close']
+
+
+# In[109]:
+
+
+#Data Set Preparation 
+X_test = X[int(len(X)*0.6):]
+X_train = X[:int(len(X)*0.6)]
+y_test = Y[int(len(Y)*0.6):]
+Y_train = Y[:int(len(Y)*0.6)]
+X_train, X_val, y_train, y_val = train_test_split(X_train, Y_train, test_size=0.3,random_state=42)
+
+print (X_train.shape, y_train.shape)
+print (X_val.shape, y_val.shape)
+
+
+# In[110]:
+
+
+grid = {
+    'learning_rate':[0.001,0.005,0.01,0.05,0.1],
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(XGBClassifier, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[112]:
+
+
+grid = {
+    'learning_rate':[0.05],
+    'n_estimators':[50,100,200,500,800,1000],
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(XGBClassifier, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[113]:
+
+
+grid = {
+    'learning_rate':[0.05],
+    'n_estimators':[100],
+    'max_depth':range(3,10),
+    'min_child_weight':range(1,6),
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(XGBClassifier, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[114]:
+
+
+grid = {
+    'learning_rate':[0.05],
+    'n_estimators':[100],
+    'max_depth':[5],
+    'min_child_weight':[4],
+    'gamma' : [0,0.1,0.5,0.8,1]
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(XGBClassifier, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[115]:
+
+
+grid = {
+    'learning_rate':[0.05],
+    'n_estimators':[100],
+    'max_depth':[5],
+    'min_child_weight':[4],
+    'gamma' : [0],
+    'subsample':[i/100.0 for i in range(60,100,5)],
+    'colsample_bytree':[i/100.0 for i in range(60,100,5)]
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(XGBClassifier, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[116]:
+
+
+grid = {
+    'learning_rate':[0.05],
+    'n_estimators':[100],
+    'max_depth':[5],
+    'min_child_weight':[4],
+    'gamma' : [0],
+    'subsample':[0.95],
+    'colsample_bytree':[0.95],
+    'reg_alpha':[1e-5, 1e-2, 0.1, 1, 100]
+}
+paramGrid = ParameterGrid(grid)
+
+bestModel, bestScore, allModels, allScores = pf.bestFit(XGBClassifier, paramGrid,
+                                                        X_train, y_train['target'], X_val, y_val['target'], 
+                                                        metric = roc_auc_score, scoreLabel = "AUC")
+
+print(bestModel, bestScore)
+
+
+# In[117]:
+
+
+#Best XGB_new
+x_prediction = X_val
+model = bestModel
+print("# Training...")
+model.fit(X_train, y_train['target'])
+print("# Predicting...")
+y_prediction = model.predict_proba(x_prediction)
+probabilities = y_prediction[:, 1]
+print("- probabilities:", probabilities[1:6])
+correct = [
+    round(x) == y
+    for (x, y) in zip(probabilities, y_val['target'])
+]
+print("- accuracy: ", sum(correct) / float(len(y_val['target'])))
+print("- validation logloss:",
+        metrics.log_loss(y_val['target'], probabilities))
+print('\n')
+x_prediction = X_test
+y_prediction = model.predict(x_prediction)
+results = y_prediction
+prob = pd.DataFrame(data={'XGB_new prediction': results},index=y_test.index)
+Close = pd.DataFrame(data={'XGB_new Close': y_test['Close']})
+prob = prob.join(Close)
+prob
+
+
+# In[118]:
+
+
+results = performance(prob['XGB_new prediction'],prob['XGB_new Close'])
+performance_df['XGB_new'] = results
+performance_df
+
+
+# In[ ]:
+
+
+
+
